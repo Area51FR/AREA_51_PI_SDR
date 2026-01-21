@@ -1,0 +1,916 @@
+#!/usr/bin/env python3
+"""
+APRS Map GUI (RTL-SDR + Direwolf)
+
+This script provides a lightweight web UI (Flask + Leaflet) to visualize APRS packet
+positions on a live map and to control receiver parameters (RTL-SDR gain and optional
+squelch threshold) used by an external APRS RX pipeline.
+
+Typical setup:
+- rtl_fm (from rtl-sdr) tuned to 144.800 MHz (APRS)
+- direwolf as TNC/decoder reading audio from rtl_fm
+- an external control script (e.g. aprs_rx_control.sh) that starts/stops the pipeline and
+  writes a log file that includes decoded packets and coordinates.
+
+Features:
+- Live map (OpenStreetMap tiles) with colored station markers (Mobile/iGate/Digi/etc.)
+- "Most recent positions" list sorted by last-seen position
+- Station detail view (recent packets + simple track polyline)
+- Start / Stop / Apply+Restart buttons (robust POST, no fragile JS control)
+- Auto-Gain helper reading Direwolf "audio level = ..." lines and nudging gain
+- Clean shutdown hooks to stop RX and release the RTL-SDR device (best-effort)
+
+Requirements:
+- Python 3 + Flask
+- Leaflet static files available locally (default: ~/static/leaflet/leaflet.js and leaflet.css)
+- rtl-sdr tools (rtl_fm) and Direwolf installed and working
+- A working RX control script + log file:
+    * RX_CONTROL_SCRIPT (default: ~/aprs_direwolf_rx.sh)
+    * RX_LOGFILE (default: ~/aprs_direwolf_rx.log)
+  The control script should support: start | stop | status
+  and should use env vars GAIN and SQUELCH if you want UI control.
+
+Notes:
+- The map loads tiles from OpenStreetMap over the internet.
+- This UI is intended for local use (binds to 127.0.0.1 by default).
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import json
+import os
+import re
+import signal
+import statistics
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from flask import Flask, request, redirect, url_for, render_template_string, jsonify
+
+
+HOME = Path.home()
+
+# External RX control + log file (adjust to your setup)
+RX_CONTROL_SCRIPT = HOME / "aprs_direwolf_rx.sh"
+RX_LOGFILE = HOME / "aprs_direwolf_rx.log"
+
+# UI state files (local user home)
+STATE_FILE = HOME / ".aprs_map_gui_state.json"
+PIDFILE = HOME / ".aprs_map_gui.pid"
+DAEMON_LOG = HOME / "aprs_map_gui_daemon.log"
+
+DEFAULT_STATE = {"gain": 35, "squelch": 0, "last_autogain": ""}
+
+# Serve ~/static for Leaflet local assets
+# Expected:
+#   ~/static/leaflet/leaflet.js
+#   ~/static/leaflet/leaflet.css
+app = Flask(__name__, static_folder=str(HOME / "static"), static_url_path="/static")
+
+# --- Patterns ---------------------------------------------------------------
+PACKET_RE = re.compile(r"^\[\s*\d+(\.\d+)?\]\s+([A-Z0-9]{1,6}(?:-\d{1,2})?)>([^:]+):(.*)$")
+COORD_RE  = re.compile(r"^N\s+(\d+)\s+(\d+\.\d+),\s+E\s+(\d+)\s+(\d+\.\d+)")
+AUDIO_RE  = re.compile(r"audio level\s*=\s*(\d+)", re.IGNORECASE)
+
+KIND_TXT = {
+  "notfunk": "Emergency/Info",
+  "igate": "iGate/Relay",
+  "digi": "Digipeater",
+  "mobile": "Mobile",
+  "unknown": "Unknown",
+}
+COLOR_FOR = {
+  "mobile": "#16a34a",   # green
+  "igate":  "#2563eb",   # blue
+  "digi":   "#7c3aed",   # purple
+  "notfunk":"#f97316",   # orange
+  "unknown":"#64748b",   # gray
+}
+
+# --- Utilities ---------------------------------------------------------------
+
+def run_cmd(cmd: List[str], env=None) -> Tuple[int, str, str]:
+  p = subprocess.run(
+    cmd,
+    capture_output=True,
+    text=True,
+    encoding="utf-8",
+    errors="replace",
+    env=env
+  )
+  return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+
+def read_last_lines(path: Path, n: int, max_bytes: int = 2_500_000) -> List[str]:
+  """
+  Tail without subprocess; UTF-8 safe (errors='replace').
+  Reads last max_bytes and returns last n lines.
+  """
+  if not path.exists():
+    return []
+  n = max(1, min(8000, int(n)))
+  max_bytes = max(4096, int(max_bytes))
+
+  with path.open("rb") as f:
+    f.seek(0, os.SEEK_END)
+    size = f.tell()
+    start = max(0, size - max_bytes)
+    f.seek(start, os.SEEK_SET)
+    data = f.read()
+
+  text = data.decode("utf-8", errors="replace")
+  lines = text.splitlines()
+  return lines[-n:]
+
+def load_state() -> dict:
+  if STATE_FILE.exists():
+    try:
+      s = json.loads(STATE_FILE.read_text())
+      if isinstance(s, dict):
+        for k, v in DEFAULT_STATE.items():
+          s.setdefault(k, v)
+        return s
+    except Exception:
+      pass
+  return dict(DEFAULT_STATE)
+
+def save_state(state: dict) -> None:
+  STATE_FILE.write_text(json.dumps(state, indent=2))
+
+def script_env(state: dict) -> dict:
+  env = os.environ.copy()
+  env["GAIN"] = str(int(state.get("gain", 35)))
+  sq = int(state.get("squelch", 0))
+  env["SQUELCH"] = "" if sq <= 0 else str(sq)
+  return env
+
+def tail_log_text(n=140) -> str:
+  lines = read_last_lines(RX_LOGFILE, n)
+  return "\n".join(lines) if lines else "(no log yet)"
+
+def status() -> Tuple[bool, str]:
+  """
+  Robust status:
+  1) ask RX_CONTROL_SCRIPT status (accept running/RUNNING etc)
+  2) fallback: check processes rtl_fm + direwolf
+  """
+  parts: List[str] = []
+  running = False
+
+  if RX_CONTROL_SCRIPT.exists():
+    rc, out, err = run_cmd([str(RX_CONTROL_SCRIPT), "status"])
+    txt = (out or err or f"rc={rc}").strip()
+    if txt:
+      parts.append(txt)
+    if re.search(r"\brunning\b", txt, re.IGNORECASE):
+      running = True
+  else:
+    parts.append("RX control script missing")
+
+  if not running:
+    try:
+      _, dw_out, _ = run_cmd(["pgrep", "-af", "direwolf"])
+      _, fm_out, _ = run_cmd(["pgrep", "-af", "rtl_fm"])
+      dw_hits = [ln for ln in (dw_out or "").splitlines() if "direwolf" in ln.lower()]
+      # Heuristic: consider rtl_fm running if tuned to APRS frequency
+      fm_hits = [ln for ln in (fm_out or "").splitlines()
+                 if "rtl_fm" in ln.lower() and ("144800" in ln or "144800000" in ln)]
+      if dw_hits and fm_hits:
+        running = True
+        parts.append("Fallback: processes active (direwolf + rtl_fm).")
+    except Exception:
+      pass
+
+  return running, " | ".join([p for p in parts if p])
+
+def dm_to_deg(deg: float, minutes: float) -> float:
+  return deg + (minutes / 60.0)
+
+def extract_comment(payload: str) -> str:
+  if "#" in payload:
+    return payload.split("#", 1)[1].strip()[:180]
+  up = payload.upper()
+  if "IGATE" in up:
+    return "iGate/relay"
+  if "EMERGENCY" in up or "NOTFUNK" in up:
+    return "emergency/info"
+  return ""
+
+def classify(payload: str, path: str) -> str:
+  up = f"{payload} {path}".upper()
+  if "NOTFUNK" in up or "EMERGENCY" in up:
+    return "notfunk"
+  if "IGATE" in up:
+    return "igate"
+  if "DIGI" in up or "FILL-IN" in up:
+    return "digi"
+  if "MIC-E" in up or "EN ROUTE" in up or "CAR" in up:
+    return "mobile"
+  return "unknown"
+
+
+# --- Station parsing ---------------------------------------------------------
+
+@dataclass
+class Station:
+  call: str
+  lat: Optional[float] = None
+  lon: Optional[float] = None
+  kind: str = "unknown"
+  comment: str = ""
+  path: str = ""
+  last_pkt_idx: int = 0
+  last_pos_idx: int = 0
+  packets: List[str] = None
+  track: List[List[float]] = None
+
+  def to_json(self):
+    d = asdict(self)
+    d["packets"] = self.packets or []
+    d["track"] = self.track or []
+    d["kind_txt"] = KIND_TXT.get(self.kind, self.kind)
+    d["color"] = COLOR_FOR.get(self.kind, COLOR_FOR["unknown"])
+    return d
+
+def parse_stations(limit: int = 350, tail_n: int = 6000, track_points: int = 20, packets_keep: int = 4):
+  lines = read_last_lines(RX_LOGFILE, tail_n)
+  stations: Dict[str, Station] = {}
+  current_call: Optional[str] = None
+  priority = {"notfunk": 5, "igate": 4, "digi": 3, "mobile": 2, "unknown": 1}
+
+  def get(call: str) -> Station:
+    if call not in stations:
+      stations[call] = Station(call=call, packets=[], track=[])
+    return stations[call]
+
+  for i, line in enumerate(lines):
+    m = PACKET_RE.match(line)
+    if m:
+      current_call = m.group(2)
+      path = m.group(3)[:160]
+      payload = m.group(4)
+
+      st = get(current_call)
+      st.path = path
+      st.last_pkt_idx = i
+
+      k = classify(payload, path)
+      if priority.get(k, 1) >= priority.get(st.kind, 1):
+        st.kind = k
+
+      cmt = extract_comment(payload)
+      if cmt:
+        st.comment = cmt
+
+      short = payload.strip()
+      if len(short) > 220:
+        short = short[:220] + "…"
+      st.packets.append(short)
+      st.packets = st.packets[-packets_keep:]
+      continue
+
+    c = COORD_RE.match(line)
+    if c and current_call:
+      lat = dm_to_deg(float(c.group(1)), float(c.group(2)))
+      lon = dm_to_deg(float(c.group(3)), float(c.group(4)))
+
+      st = get(current_call)
+      st.lat, st.lon = lat, lon
+      st.last_pos_idx = i
+
+      st.track.append([lat, lon])
+      if len(st.track) >= 2 and st.track[-1] == st.track[-2]:
+        st.track.pop()
+      st.track = st.track[-track_points:]
+
+  st_list = list(stations.values())[:max(1, int(limit))]
+  pos_st = [s for s in stations.values() if s.lat is not None and s.lon is not None]
+  last = max(pos_st, key=lambda s: s.last_pos_idx).to_json() if pos_st else None
+  return st_list, last
+
+def interpret_last(last: Optional[dict]) -> str:
+  if not last:
+    return "No position packets seen yet."
+  call = last.get("call", "?")
+  kind_txt = last.get("kind_txt", KIND_TXT.get(last.get("kind","unknown"), "Station"))
+  lat = last.get("lat")
+  lon = last.get("lon")
+  comment = (last.get("comment") or "").strip()
+  s = f"{call} ({kind_txt}) — position {lat:.5f}, {lon:.5f}"
+  if comment:
+    s += f". Note: “{comment}”"
+  s += " | Colors: Blue=iGate, Green=Mobile, Purple=Digi, Orange=Emergency/Info, Gray=Unknown"
+  return s
+
+
+# --- RX control + AutoGain ---------------------------------------------------
+
+def do_apply(gain: int, squelch: int, mode: str) -> Tuple[bool, str]:
+  st = load_state()
+  st["gain"] = max(0, min(49, int(gain)))
+  st["squelch"] = max(0, min(200, int(squelch)))
+  save_state(st)
+
+  env = script_env(st)
+  if not RX_CONTROL_SCRIPT.exists():
+    return False, "RX control script missing"
+
+  if mode == "stop":
+    rc, out, err = run_cmd([str(RX_CONTROL_SCRIPT), "stop"], env=env)
+  elif mode == "start":
+    rc, out, err = run_cmd([str(RX_CONTROL_SCRIPT), "start"], env=env)
+  else:
+    run_cmd([str(RX_CONTROL_SCRIPT), "stop"], env=env)
+    rc, out, err = run_cmd([str(RX_CONTROL_SCRIPT), "start"], env=env)
+
+  return True, (out or err or "").strip()
+
+def autogain_compute(old_gain: int, target: int = 50) -> Tuple[int, str]:
+  lines = read_last_lines(RX_LOGFILE, 1500)
+  levels: List[int] = []
+  for ln in lines:
+    m = AUDIO_RE.search(ln)
+    if m:
+      try:
+        levels.append(int(m.group(1)))
+      except Exception:
+        pass
+  levels = levels[-50:]
+  if not levels:
+    return old_gain, "AutoGain: no 'audio level' values found yet."
+
+  med = int(statistics.median(levels))
+  new_gain = old_gain
+
+  # Conservative step adjustments to avoid oscillation
+  if med >= 70:
+    new_gain -= 6
+  elif med >= 60:
+    new_gain -= 4
+  elif med >= 55:
+    new_gain -= 2
+  elif med <= 20:
+    new_gain += 6
+  elif med <= 30:
+    new_gain += 4
+  elif med <= 38:
+    new_gain += 2
+
+  new_gain = max(0, min(49, new_gain))
+  return new_gain, f"AutoGain: median audio={med} → gain {old_gain} → {new_gain} (target ~{target})"
+
+def stop_rx_release_rtl() -> None:
+  """
+  Clean release:
+  - Call RX control script stop (preferred)
+  - Fallback: kill rtl_fm tuned to 144.800 (SIGTERM then SIGKILL) to release the RTL-SDR.
+  """
+  st = load_state()
+  env = script_env(st)
+
+  if RX_CONTROL_SCRIPT.exists():
+    try:
+      run_cmd([str(RX_CONTROL_SCRIPT), "stop"], env=env)
+    except Exception:
+      pass
+
+  # Ensure dongle is freed
+  try:
+    _, out, _ = run_cmd(["pgrep", "-af", "rtl_fm"])
+    pids: List[int] = []
+    for ln in (out or "").splitlines():
+      m = re.match(r"^\s*(\d+)\s+(.*)$", ln)
+      if not m:
+        continue
+      pid = int(m.group(1))
+      cmd = m.group(2)
+      if "144800" in cmd or "144800000" in cmd:
+        pids.append(pid)
+
+    for pid in pids:
+      try:
+        os.kill(pid, signal.SIGTERM)
+      except Exception:
+        pass
+
+    if pids:
+      time.sleep(0.3)
+      for pid in pids:
+        try:
+          os.kill(pid, 0)
+          os.kill(pid, signal.SIGKILL)
+        except Exception:
+          pass
+  except Exception:
+    pass
+
+
+# --- Shutdown / daemon -------------------------------------------------------
+
+_CLEANING = False
+
+def _cleanup(reason: str = "") -> None:
+  global _CLEANING
+  if _CLEANING:
+    return
+  _CLEANING = True
+  try:
+    stop_rx_release_rtl()
+  finally:
+    try:
+      if PIDFILE.exists() and PIDFILE.read_text().strip() == str(os.getpid()):
+        PIDFILE.unlink(missing_ok=True)
+    except Exception:
+      pass
+
+def _signal_handler(signum, frame):
+  _cleanup(f"signal {signum}")
+  os._exit(0)
+
+def setup_shutdown_hooks():
+  atexit.register(_cleanup, "atexit")
+  for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(s, _signal_handler)
+
+def daemonize():
+  """
+  Detach from terminal (double-fork). Stdout/stderr → DAEMON_LOG.
+  """
+  if os.fork() > 0:
+    os._exit(0)
+  os.setsid()
+  if os.fork() > 0:
+    os._exit(0)
+
+  os.umask(0o22)
+  sys.stdout.flush()
+  sys.stderr.flush()
+
+  with open(DAEMON_LOG, "a", buffering=1) as f:
+    os.dup2(f.fileno(), 1)
+    os.dup2(f.fileno(), 2)
+
+  with open(os.devnull, "r") as dn:
+    os.dup2(dn.fileno(), 0)
+
+  PIDFILE.write_text(str(os.getpid()))
+
+def daemon_stop():
+  if not PIDFILE.exists():
+    print("No PIDFILE – daemon likely not running.")
+    return 0
+  try:
+    pid = int(PIDFILE.read_text().strip())
+  except Exception:
+    print("PIDFILE invalid.")
+    return 1
+
+  try:
+    os.kill(pid, signal.SIGTERM)
+  except ProcessLookupError:
+    PIDFILE.unlink(missing_ok=True)
+    return 0
+  except Exception as e:
+    print(f"Could not stop daemon: {e}")
+    return 1
+
+  for _ in range(30):
+    try:
+      os.kill(pid, 0)
+      time.sleep(0.1)
+    except ProcessLookupError:
+      break
+    except Exception:
+      break
+
+  PIDFILE.unlink(missing_ok=True)
+  print("Daemon stopped.")
+  return 0
+
+
+# --- Web UI ------------------------------------------------------------------
+
+HTML = r"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>APRS Map</title>
+  <link rel="stylesheet" href="/static/leaflet/leaflet.css">
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; }
+    .layout { display: grid; grid-template-columns: 1fr 460px; height: 100vh; }
+    #map { width: 100%; height: 100%; background: #fff; }
+    .side { padding: 14px; border-left: 1px solid #ddd; overflow: auto; background: #fafafa; }
+    .h { font-size: 18px; font-weight: 900; margin: 6px 0 10px; }
+    .muted { color: #666; font-size: 13px; }
+    .card { background: #fff; border: 1px solid #e3e3e3; border-radius: 12px; padding: 12px; margin-bottom: 12px; }
+    .row { display:flex; align-items:center; gap:10px; flex-wrap: wrap; margin: 10px 0; }
+    input[type=range] { width: 240px; }
+    button { padding: 8px 10px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; background: #fff; }
+    .btn-mini { padding: 6px 10px; }
+    .pill { padding: 2px 10px; border-radius: 999px; border: 1px solid #ddd; display:inline-block; font-weight: 900; font-size: 12px; }
+    .ok { color: #0a7; }
+    .bad { color: #c33; }
+    .legend { display:flex; gap:10px; flex-wrap: wrap; font-size: 12px; margin-top: 8px;}
+    .litem { display:flex; align-items:center; gap:6px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display:inline-block; border:1px solid rgba(0,0,0,.25); }
+    .list { display:flex; flex-direction: column; gap: 8px; }
+    .item { padding: 10px; border: 1px solid #eee; border-radius: 12px; background: #fff; cursor: pointer; }
+    .item:hover { border-color: #ddd; }
+    .call { font-weight: 900; }
+    .coord { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #333; }
+    .comm { font-size: 12px; color: #555; margin-top: 4px; }
+    .detail { font-size: 13px; line-height: 1.35; }
+    .detail .k { color:#666; font-size: 12px; }
+    .detail pre { background:#0b0b0b; color:#e7e7e7; padding:10px; border-radius:12px; overflow-x:auto; max-height: 180px; }
+    details pre { background:#0b0b0b; color:#e7e7e7; padding:10px; border-radius:12px; overflow-x:auto; max-height: 220px; }
+    #jsStatus {
+      position: fixed; left: 12px; bottom: 12px; z-index: 9999;
+      background: rgba(0,0,0,.75); color: #fff; padding: 6px 10px;
+      border-radius: 10px; font-size: 12px; max-width: 60vw; white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="jsStatus">JS: booting…</div>
+
+  <div class="layout">
+    <div id="map"></div>
+
+    <div class="side">
+      <div class="h">APRS Map</div>
+      <div class="muted">Colors: Blue=iGate, Green=Mobile, Purple=Digi, Orange=Emergency/Info, Gray=Unknown</div>
+
+      <div class="card">
+        <div class="row">
+          <div>Status:</div>
+          <div id="statusBadge" class="pill {{ 'ok' if running else 'bad' }}">{{ 'RUNNING' if running else 'STOPPED' }}</div>
+          <div id="statusText" class="muted">{{ status_text }}</div>
+        </div>
+
+        <form method="post" action="/apply">
+          <input type="hidden" id="mode" name="mode" value="restart">
+
+          <div class="row">
+            <b>Gain</b>
+            <input id="gain" name="gain" type="range" min="0" max="49" value="{{ gain }}" oninput="gainVal.value=gain.value">
+            <output id="gainVal">{{ gain }}</output>
+            <button class="btn-mini" type="button" onclick="nudge('gain',-1)">-1</button>
+            <button class="btn-mini" type="button" onclick="nudge('gain',+1)">+1</button>
+          </div>
+
+          <div class="row">
+            <b>Squelch</b>
+            <input id="squelch" name="squelch" type="range" min="0" max="200" value="{{ squelch }}" oninput="sqVal.value=squelch.value">
+            <output id="sqVal">{{ squelch }}</output>
+            <button class="btn-mini" type="button" onclick="nudge('squelch',-5)">-5</button>
+            <button class="btn-mini" type="button" onclick="nudge('squelch',+5)">+5</button>
+          </div>
+
+          <div class="row">
+            <button type="submit" onclick="document.getElementById('mode').value='restart'">Apply + Restart</button>
+            <button type="submit" onclick="document.getElementById('mode').value='start'">Start</button>
+            <button type="submit" onclick="document.getElementById('mode').value='stop'">Stop</button>
+            <button type="submit" formaction="/autogain" formmethod="post">Auto Gain</button>
+          </div>
+
+          <div class="legend">
+            <div class="litem"><span class="dot" style="background:#16a34a"></span>Mobile</div>
+            <div class="litem"><span class="dot" style="background:#2563eb"></span>iGate</div>
+            <div class="litem"><span class="dot" style="background:#7c3aed"></span>Digi</div>
+            <div class="litem"><span class="dot" style="background:#f97316"></span>Emergency/Info</div>
+            <div class="litem"><span class="dot" style="background:#64748b"></span>Unknown</div>
+          </div>
+
+          {% if last_autogain %}
+            <div class="muted" style="margin-top:10px">{{ last_autogain }}</div>
+          {% endif %}
+        </form>
+      </div>
+
+      <div class="card">
+        <div class="row"><b>Summary</b><span class="muted">(latest position packet)</span></div>
+        <div id="interpretBox">{{ interpretation }}</div>
+      </div>
+
+      <div class="card">
+        <div class="row"><b>Most recent positions</b><span class="muted">(click → zoom)</span></div>
+        <div id="posList" class="list"></div>
+      </div>
+
+      <div class="card">
+        <div class="row"><b>Station details</b><span class="muted">(selection)</span></div>
+        <div id="detailBox" class="detail">Click a marker or a station in the list.</div>
+      </div>
+
+      <div class="card">
+        <details>
+          <summary><b>Log (details)</b> <span class="muted">— optional</span></summary>
+          <pre id="logBox">{{ log_tail }}</pre>
+        </details>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/leaflet/leaflet.js"></script>
+
+<script>
+let map, markersLayer, trackLayer;
+let stationIndex = new Map();
+let selectedCall = null;
+
+function setStatus(txt) {
+  const el = document.getElementById("jsStatus");
+  if (el) el.textContent = txt;
+}
+window.onerror = function(msg, src, line, col) {
+  setStatus(`JS ERROR: ${msg}\n${src}:${line}:${col}`);
+};
+
+function iconDot(color) {
+  return L.divIcon({
+    className: "",
+    html: `<div style="width:12px;height:12px;border-radius:50%;background:${color};
+           border:2px solid rgba(255,255,255,.9);box-shadow:0 0 0 1px rgba(0,0,0,.25);"></div>`,
+    iconSize: [12,12],
+    iconAnchor: [6,6],
+  });
+}
+
+function initMap() {
+  if (!window.L) { setStatus("Leaflet not loaded (window.L missing)."); return; }
+  map = L.map('map').setView([47.55, 7.59], 9);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  markersLayer = L.layerGroup().addTo(map);
+  trackLayer = L.layerGroup().addTo(map);
+
+  setStatus("JS OK: Leaflet ready ✅");
+  setTimeout(() => map.invalidateSize(true), 400);
+}
+
+function setDetail(st) {
+  if (!st) return;
+  selectedCall = st.call;
+
+  const coord = (st.lat != null && st.lon != null) ? `${st.lat.toFixed(5)}, ${st.lon.toFixed(5)}` : "—";
+  const packets = (st.packets || []).slice().reverse().map(p => `• ${p}`).join("\n");
+
+  document.getElementById("detailBox").innerHTML = `
+    <div><span class="k">Call:</span> <b>${st.call}</b></div>
+    <div><span class="k">Type:</span> ${st.kind_txt}</div>
+    <div><span class="k">Coordinates:</span> <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">${coord}</span></div>
+    <div><span class="k">Comment:</span> ${st.comment ? st.comment : "—"}</div>
+    <div style="margin-top:8px"><span class="k">Recent payloads:</span></div>
+    <pre>${packets || "(none)"}<\/pre>
+  `;
+
+  trackLayer.clearLayers();
+  if (st.track && st.track.length >= 2) {
+    L.polyline(st.track, {weight: 4, opacity: 0.9}).addTo(trackLayer);
+  }
+}
+
+function renderList(stations) {
+  const box = document.getElementById("posList");
+  box.innerHTML = "";
+
+  const withPos = stations.filter(s => s.lat != null && s.lon != null);
+
+  // Sort by newest position seen (bugfix)
+  withPos.sort((a,b) => (b.last_pos_idx||0) - (a.last_pos_idx||0));
+
+  const top = withPos.slice(0, 18);
+
+  for (const st of top) {
+    const div = document.createElement("div");
+    div.className = "item";
+    div.innerHTML = `
+      <div class="call">${st.call} <span style="color:${st.color}">●</span></div>
+      <div class="coord">${st.lat.toFixed(5)}, ${st.lon.toFixed(5)}</div>
+      <div class="comm">${st.kind_txt}${st.comment ? " — " + st.comment : ""}</div>
+    `;
+    div.onclick = () => {
+      map.setView([st.lat, st.lon], 12, {animate:true});
+      setDetail(st);
+    };
+    box.appendChild(div);
+  }
+}
+
+function redrawMarkers(stations) {
+  if (!map || !markersLayer) return;
+  markersLayer.clearLayers();
+  stationIndex.clear();
+
+  for (const st of stations) {
+    stationIndex.set(st.call, st);
+    if (st.lat == null || st.lon == null) continue;
+
+    const label = `
+      <b>${st.call}</b><br/>
+      Type: ${st.kind_txt}<br/>
+      ${st.comment || ""}<br/>
+      <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">
+        ${st.lat.toFixed(5)}, ${st.lon.toFixed(5)}
+      </span>
+    `;
+
+    const marker = L.marker([st.lat, st.lon], {icon: iconDot(st.color)}).bindPopup(label);
+    marker.on("click", () => setDetail(st));
+    marker.addTo(markersLayer);
+  }
+
+  if (selectedCall && stationIndex.has(selectedCall)) {
+    setDetail(stationIndex.get(selectedCall));
+  }
+}
+
+async function refreshAll() {
+  try {
+    const sres = await fetch("/api/status?n=140", {cache:"no-store"});
+    const s = await sres.json();
+
+    const badge = document.getElementById("statusBadge");
+    const stxt  = document.getElementById("statusText");
+    badge.textContent = s.running ? "RUNNING" : "STOPPED";
+    badge.classList.remove("ok","bad");
+    badge.classList.add(s.running ? "ok" : "bad");
+    stxt.textContent = s.status_text;
+
+    const details = document.querySelector("details");
+    if (details && details.open) document.getElementById("logBox").textContent = s.log_tail;
+
+    const pres = await fetch("/api/stations?limit=350", {cache:"no-store"});
+    const p = await pres.json();
+
+    document.getElementById("interpretBox").textContent = p.interpretation || "";
+    renderList(p.stations || []);
+    redrawMarkers(p.stations || []);
+  } catch(e) {}
+}
+
+async function nudge(field, delta) {
+  const gainEl = document.getElementById("gain");
+  const squelchEl = document.getElementById("squelch");
+
+  if (field === "gain") {
+    let v = Math.max(0, Math.min(49, parseInt(gainEl.value,10) + delta));
+    gainEl.value = v; document.getElementById("gainVal").value = v;
+  }
+  if (field === "squelch") {
+    let v = Math.max(0, Math.min(200, parseInt(squelchEl.value,10) + delta));
+    squelchEl.value = v; document.getElementById("sqVal").value = v;
+  }
+
+  await fetch("/api/nudge", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({field, delta})
+  });
+  setTimeout(refreshAll, 400);
+}
+
+window.addEventListener("load", () => {
+  initMap();
+  refreshAll();
+  setInterval(refreshAll, 2000);
+});
+</script>
+
+</body>
+</html>
+"""
+
+# --- Routes ------------------------------------------------------------------
+
+@app.get("/")
+def index():
+  st = load_state()
+  running, stxt = status()
+  stations, last = parse_stations(limit=350, tail_n=6000)
+  return render_template_string(
+    HTML,
+    gain=int(st.get("gain", 35)),
+    squelch=int(st.get("squelch", 0)),
+    running=running,
+    status_text=stxt,
+    interpretation=interpret_last(last),
+    log_tail=tail_log_text(140),
+    last_autogain=st.get("last_autogain",""),
+  )
+
+@app.post("/apply")
+def apply_form():
+  st = load_state()
+  try:
+    gain = int(request.form.get("gain", st.get("gain", 35)))
+    squelch = int(request.form.get("squelch", st.get("squelch", 0)))
+  except Exception:
+    gain = int(st.get("gain", 35))
+    squelch = int(st.get("squelch", 0))
+  mode = (request.form.get("mode", "restart") or "restart").strip().lower()
+  do_apply(gain, squelch, mode)
+  return redirect(url_for("index"))
+
+@app.post("/autogain")
+def autogain_form():
+  st = load_state()
+  old_gain = int(st.get("gain", 35))
+
+  new_gain, msg = autogain_compute(old_gain)
+  st["gain"] = new_gain
+  st["last_autogain"] = msg
+  save_state(st)
+
+  running, _ = status()
+  if running and new_gain != old_gain and RX_CONTROL_SCRIPT.exists():
+    env = script_env(st)
+    run_cmd([str(RX_CONTROL_SCRIPT), "stop"], env=env)
+    run_cmd([str(RX_CONTROL_SCRIPT), "start"], env=env)
+
+  return redirect(url_for("index"))
+
+@app.get("/api/status")
+def api_status():
+  n = request.args.get("n", default="140")
+  try:
+    n = max(20, min(800, int(n)))
+  except Exception:
+    n = 140
+  running, stxt = status()
+  return jsonify({"running": running, "status_text": stxt, "log_tail": tail_log_text(n)})
+
+@app.get("/api/stations")
+def api_stations():
+  limit = request.args.get("limit", default="350")
+  try:
+    limit = max(50, min(1200, int(limit)))
+  except Exception:
+    limit = 350
+  stations, last = parse_stations(limit=limit, tail_n=6000)
+  return jsonify({
+    "stations": [s.to_json() for s in stations],
+    "last": last,
+    "interpretation": interpret_last(last),
+  })
+
+@app.post("/api/nudge")
+def api_nudge():
+  data = request.get_json(force=True, silent=True) or {}
+  field = data.get("field")
+  delta = int(data.get("delta", 0))
+
+  st = load_state()
+  if field == "gain":
+    st["gain"] = max(0, min(49, int(st.get("gain", 35)) + delta))
+  elif field == "squelch":
+    st["squelch"] = max(0, min(200, int(st.get("squelch", 0)) + delta))
+  else:
+    return jsonify({"ok": False, "error": "bad field"}), 400
+
+  save_state(st)
+
+  running, _ = status()
+  if running and RX_CONTROL_SCRIPT.exists():
+    env = script_env(st)
+    run_cmd([str(RX_CONTROL_SCRIPT), "stop"], env=env)
+    run_cmd([str(RX_CONTROL_SCRIPT), "start"], env=env)
+
+  return jsonify({"ok": True, "state": st})
+
+# --- Main --------------------------------------------------------------------
+
+def main():
+  parser = argparse.ArgumentParser(description="APRS map GUI for RTL-SDR + Direwolf")
+  parser.add_argument("--host", default="127.0.0.1")
+  parser.add_argument("--port", type=int, default=5000)
+  parser.add_argument("--daemon", action="store_true", help="Run in background (no terminal attached)")
+  parser.add_argument("--stop", action="store_true", help="Stop daemon and release RTL-SDR")
+  args = parser.parse_args()
+
+  if args.stop:
+    rc = daemon_stop()
+    stop_rx_release_rtl()
+    return rc
+
+  setup_shutdown_hooks()
+
+  if args.daemon:
+    daemonize()
+
+  app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
+  return 0
+
+if __name__ == "__main__":
+  raise SystemExit(main())
