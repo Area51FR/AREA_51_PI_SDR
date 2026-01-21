@@ -1,0 +1,23 @@
+### APRS Map GUI (RTL-SDR + Direwolf)
+
+A lightweight local web dashboard to visualize APRS positions on a live Leaflet map and control RTL-SDR gain (and optional squelch) for an external APRS RX pipeline.
+
+**Stack**
+- `rtl_fm` (rtl-sdr) for 144.800 MHz receive
+- `direwolf` for AX.25/APRS decoding
+- Python 3 + Flask for the UI backend
+- Leaflet (local static files) + OpenStreetMap tiles for mapping
+
+**How it works**
+The GUI expects:
+- an RX control script supporting `start|stop|status` (default: `~/aprs_direwolf_rx.sh`)
+- a log file containing decoded packets and coordinates (default: `~/aprs_direwolf_rx.log`)
+
+The control script may use environment variables:
+- `GAIN` (0..49)
+- `SQUELCH` (optional)
+
+**Run**
+- Foreground: `python3 aprs_map_gui.py`
+- Background: `python3 aprs_map_gui.py --daemon`
+- Stop daemon + release RTL-SDR: `python3 aprs_map_gui.py --stop`
